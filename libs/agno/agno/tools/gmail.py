@@ -46,13 +46,23 @@ A token.json file will be created to store the authentication credentials for fu
 import base64
 import mimetypes
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import wraps
 from os import getenv
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from agno.tools import Toolkit
+
+
+@dataclass
+class GmailAccount:
+    """Configuration for a Gmail account."""
+
+    id: str  # e.g., "personal", "work"
+    email: str  # e.g., "me@gmail.com"
+    token_path: str  # e.g., "tokens/gmail_personal.json"
 
 try:
     from email.mime.application import MIMEApplication
@@ -106,6 +116,8 @@ class GmailTools(Toolkit):
         token_path: Optional[str] = None,
         scopes: Optional[List[str]] = None,
         port: Optional[int] = None,
+        accounts: Optional[Dict[str, GmailAccount]] = None,
+        default_account_id: Optional[str] = None,
         **kwargs,
     ):
         """Initialize GmailTools and authenticate with Gmail API
@@ -116,6 +128,8 @@ class GmailTools(Toolkit):
             token_path (Optional[str]): Path to token file. Defaults to None.
             scopes (Optional[List[str]]): Custom OAuth scopes. If None, uses DEFAULT_SCOPES.
             port (Optional[int]): Port to use for OAuth authentication. Defaults to None.
+            accounts (Optional[Dict[str, GmailAccount]]): Dict of account_id -> GmailAccount for multi-account support.
+            default_account_id (Optional[str]): Default account to use when multiple accounts are configured.
         """
         self.creds = creds
         self.credentials_path = credentials_path
@@ -124,7 +138,15 @@ class GmailTools(Toolkit):
         self.scopes = scopes or self.DEFAULT_SCOPES
         self.port = port
 
+        # Multi-account support
+        self.accounts: Dict[str, GmailAccount] = accounts or {}
+        self.active_account_id: Optional[str] = default_account_id or (next(iter(self.accounts)) if self.accounts else None)
+
         tools: List[Any] = [
+            # Account management (multi-account)
+            self.list_accounts,
+            self.get_active_account,
+            self.set_active_account,
             # Reading emails
             self.get_latest_emails,
             self.get_emails_from_user,
@@ -180,9 +202,16 @@ class GmailTools(Toolkit):
             if modify_scope not in self.scopes:
                 raise ValueError(f"The scope {modify_scope} is required for email modification operations")
 
+    def _get_token_file(self) -> Path:
+        """Get the token file path for the active account."""
+        if self.accounts and self.active_account_id:
+            account = self.accounts[self.active_account_id]
+            return Path(account.token_path)
+        return Path(self.token_path or "token.json")
+
     def _auth(self) -> None:
         """Authenticate with Gmail API"""
-        token_file = Path(self.token_path or "token.json")
+        token_file = self._get_token_file()
         creds_file = Path(self.credentials_path or "credentials.json")
 
         if token_file.exists():
@@ -211,8 +240,75 @@ class GmailTools(Toolkit):
 
             # Save the credentials for future use
             if self.creds and self.creds.valid:
+                token_file.parent.mkdir(parents=True, exist_ok=True)
                 token_file.write_text(self.creds.to_json())
 
+    # =========================================================================
+    # Account Management (Multi-account support)
+    # =========================================================================
+    def list_accounts(self) -> str:
+        """
+        List all configured Gmail accounts for this agent.
+
+        Returns:
+            str: A numbered list of all configured Gmail accounts.
+        """
+        if not self.accounts:
+            return "Only a single Gmail account is configured (default mode)."
+
+        lines = []
+        for i, acc in enumerate(self.accounts.values(), start=1):
+            marker = " (active)" if acc.id == self.active_account_id else ""
+            lines.append(f"{i}. {acc.id} — {acc.email}{marker}")
+        return "Configured Gmail accounts:\n" + "\n".join(lines)
+
+    def get_active_account(self) -> str:
+        """
+        Show the currently active Gmail account.
+
+        Returns:
+            str: Information about the currently active Gmail account.
+        """
+        if not self.accounts or not self.active_account_id:
+            return "Using default Gmail account (single-account mode)."
+        acc = self.accounts[self.active_account_id]
+        return f"Active Gmail account: {acc.id} — {acc.email}"
+
+    def set_active_account(self, account_id_or_email: str) -> str:
+        """
+        Switch the active Gmail account by id or email.
+
+        Args:
+            account_id_or_email (str): The account ID (e.g., 'personal', 'work') or email address.
+
+        Returns:
+            str: Confirmation message indicating the new active account.
+        """
+        if not self.accounts:
+            return "Multi-account mode is not configured. Only a single account is available."
+
+        # Find by id or email
+        target_id = None
+        for acc_id, acc in self.accounts.items():
+            if acc_id == account_id_or_email or acc.email.lower() == account_id_or_email.lower():
+                target_id = acc_id
+                break
+
+        if not target_id:
+            valid = ", ".join(self.accounts.keys())
+            return f"Account '{account_id_or_email}' not found. Available accounts: {valid}"
+
+        self.active_account_id = target_id
+        # Force re-auth on next call for the new account
+        self.creds = None
+        self.service = None
+
+        acc = self.accounts[target_id]
+        return f"Switched to Gmail account: {acc.id} — {acc.email}"
+
+    # =========================================================================
+    # Email Formatting
+    # =========================================================================
     def _format_emails(self, emails: List[dict]) -> str:
         """Format list of email dictionaries into a readable string"""
         if not emails:
