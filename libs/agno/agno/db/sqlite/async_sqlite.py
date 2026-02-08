@@ -7,7 +7,7 @@ from uuid import uuid4
 if TYPE_CHECKING:
     from agno.tracing.schemas import Span, Trace
 
-from agno.db.base import AsyncBaseDb, SessionType
+from agno.db.base import AsyncBaseDb, ComponentType, SessionType
 from agno.db.migrations.manager import MigrationManager
 from agno.db.schemas.culture import CulturalKnowledge
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
@@ -31,7 +31,7 @@ from agno.utils.log import log_debug, log_error, log_info, log_warning
 from agno.utils.string import generate_id
 
 try:
-    from sqlalchemy import Column, MetaData, String, Table, func, select, text, update
+    from sqlalchemy import Column, ForeignKey, MetaData, String, Table, func, select, text
     from sqlalchemy.dialects import sqlite
     from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
     from sqlalchemy.schema import Index, UniqueConstraint
@@ -54,6 +54,7 @@ class AsyncSqliteDb(AsyncBaseDb):
         traces_table: Optional[str] = None,
         spans_table: Optional[str] = None,
         versions_table: Optional[str] = None,
+        learnings_table: Optional[str] = None,
         id: Optional[str] = None,
     ):
         """
@@ -78,6 +79,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             traces_table (Optional[str]): Name of the table to store run traces.
             spans_table (Optional[str]): Name of the table to store span events.
             versions_table (Optional[str]): Name of the table to store schema versions.
+            learnings_table (Optional[str]): Name of the table to store learning records.
             id (Optional[str]): ID of the database.
 
         Raises:
@@ -98,6 +100,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             traces_table=traces_table,
             spans_table=spans_table,
             versions_table=versions_table,
+            learnings_table=learnings_table,
         )
 
         _engine: Optional[AsyncEngine] = db_engine
@@ -124,6 +127,15 @@ class AsyncSqliteDb(AsyncBaseDb):
         # Initialize database session factory
         self.async_session_factory = async_sessionmaker(bind=self.db_engine, expire_on_commit=False)
 
+    async def close(self) -> None:
+        """Close database connections and dispose of the connection pool.
+
+        Should be called during application shutdown to properly release
+        all database connections.
+        """
+        if self.db_engine is not None:
+            await self.db_engine.dispose()
+
     # -- DB methods --
     async def table_exists(self, table_name: str) -> bool:
         """Check if a table with the given name exists in the SQLite database.
@@ -146,6 +158,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             (self.eval_table_name, "evals"),
             (self.knowledge_table_name, "knowledge"),
             (self.versions_table_name, "versions"),
+            (self.learnings_table_name, "learnings"),
         ]
 
         for table_name, table_type in tables_to_create:
@@ -165,7 +178,8 @@ class AsyncSqliteDb(AsyncBaseDb):
             Table: SQLAlchemy Table object
         """
         try:
-            table_schema = get_table_schema_definition(table_type)
+            # Pass traces_table_name for spans table foreign key resolution
+            table_schema = get_table_schema_definition(table_type, traces_table_name=self.trace_table_name).copy()
 
             columns: List[Column] = []
             indexes: List[str] = []
@@ -186,6 +200,10 @@ class AsyncSqliteDb(AsyncBaseDb):
                 if col_config.get("unique", False):
                     column_kwargs["unique"] = True
                     unique_constraints.append(col_name)
+
+                # Handle foreign key constraint
+                if "foreign_key" in col_config:
+                    column_args.append(ForeignKey(col_config["foreign_key"]))
 
                 columns.append(Column(*column_args, **column_kwargs))  # type: ignore
 
@@ -245,87 +263,87 @@ class AsyncSqliteDb(AsyncBaseDb):
 
     async def _get_table(self, table_type: str, create_table_if_not_found: Optional[bool] = False) -> Optional[Table]:
         if table_type == "sessions":
-            if not hasattr(self, "session_table"):
-                self.session_table = await self._get_or_create_table(
-                    table_name=self.session_table_name,
-                    table_type=table_type,
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.session_table = await self._get_or_create_table(
+                table_name=self.session_table_name,
+                table_type=table_type,
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.session_table
 
         elif table_type == "memories":
-            if not hasattr(self, "memory_table"):
-                self.memory_table = await self._get_or_create_table(
-                    table_name=self.memory_table_name,
-                    table_type="memories",
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.memory_table = await self._get_or_create_table(
+                table_name=self.memory_table_name,
+                table_type="memories",
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.memory_table
 
         elif table_type == "metrics":
-            if not hasattr(self, "metrics_table"):
-                self.metrics_table = await self._get_or_create_table(
-                    table_name=self.metrics_table_name,
-                    table_type="metrics",
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.metrics_table = await self._get_or_create_table(
+                table_name=self.metrics_table_name,
+                table_type="metrics",
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.metrics_table
 
         elif table_type == "evals":
-            if not hasattr(self, "eval_table"):
-                self.eval_table = await self._get_or_create_table(
-                    table_name=self.eval_table_name,
-                    table_type="evals",
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.eval_table = await self._get_or_create_table(
+                table_name=self.eval_table_name,
+                table_type="evals",
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.eval_table
 
         elif table_type == "knowledge":
-            if not hasattr(self, "knowledge_table"):
-                self.knowledge_table = await self._get_or_create_table(
-                    table_name=self.knowledge_table_name,
-                    table_type="knowledge",
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.knowledge_table = await self._get_or_create_table(
+                table_name=self.knowledge_table_name,
+                table_type="knowledge",
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.knowledge_table
 
         elif table_type == "culture":
-            if not hasattr(self, "culture_table"):
-                self.culture_table = await self._get_or_create_table(
-                    table_name=self.culture_table_name,
-                    table_type="culture",
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.culture_table = await self._get_or_create_table(
+                table_name=self.culture_table_name,
+                table_type="culture",
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.culture_table
 
         elif table_type == "versions":
-            if not hasattr(self, "versions_table"):
-                self.versions_table = await self._get_or_create_table(
-                    table_name=self.versions_table_name,
-                    table_type="versions",
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.versions_table = await self._get_or_create_table(
+                table_name=self.versions_table_name,
+                table_type="versions",
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.versions_table
 
         elif table_type == "traces":
-            if not hasattr(self, "traces_table"):
-                self.traces_table = await self._get_or_create_table(
-                    table_name=self.trace_table_name,
-                    table_type="traces",
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.traces_table = await self._get_or_create_table(
+                table_name=self.trace_table_name,
+                table_type="traces",
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.traces_table
 
         elif table_type == "spans":
-            if not hasattr(self, "spans_table"):
-                # Ensure traces table exists first (spans has FK to traces)
+            # Ensure traces table exists first (spans has FK to traces)
+            if create_table_if_not_found:
                 await self._get_table(table_type="traces", create_table_if_not_found=True)
-                self.spans_table = await self._get_or_create_table(
-                    table_name=self.span_table_name,
-                    table_type="spans",
-                    create_table_if_not_found=create_table_if_not_found,
-                )
+            self.spans_table = await self._get_or_create_table(
+                table_name=self.span_table_name,
+                table_type="spans",
+                create_table_if_not_found=create_table_if_not_found,
+            )
             return self.spans_table
+
+        elif table_type == "learnings":
+            self.learnings_table = await self._get_or_create_table(
+                table_name=self.learnings_table_name,
+                table_type="learnings",
+                create_table_if_not_found=create_table_if_not_found,
+            )
+            return self.learnings_table
 
         else:
             raise ValueError(f"Unknown table type: '{table_type}'")
@@ -335,7 +353,7 @@ class AsyncSqliteDb(AsyncBaseDb):
         table_name: str,
         table_type: str,
         create_table_if_not_found: Optional[bool] = False,
-    ) -> Table:
+    ) -> Optional[Table]:
         """
         Check if the table exists and is valid, else create it.
 
@@ -349,7 +367,9 @@ class AsyncSqliteDb(AsyncBaseDb):
         async with self.async_session_factory() as sess, sess.begin():
             table_is_available = await ais_table_available(session=sess, table_name=table_name)
 
-        if (not table_is_available) and create_table_if_not_found:
+        if not table_is_available:
+            if not create_table_if_not_found:
+                return None
             return await self._create_table(table_name=table_name, table_type=table_type)
 
         # SQLite version of table validation (no schema)
@@ -1540,7 +1560,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             Exception: If an error occurs during retrieval.
         """
         try:
-            table = await self._get_table(table_type="sessions")
+            table = await self._get_table(table_type="sessions", create_table_if_not_found=True)
             if table is None:
                 return []
 
@@ -1825,7 +1845,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             Optional[KnowledgeRow]: The upserted knowledge row, or None if the operation fails.
         """
         try:
-            table = await self._get_table(table_type="knowledge")
+            table = await self._get_table(table_type="knowledge", create_table_if_not_found=True)
             if table is None:
                 return None
 
@@ -1878,7 +1898,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             Exception: If an error occurs during creation.
         """
         try:
-            table = await self._get_table(table_type="evals")
+            table = await self._get_table(table_type="evals", create_table_if_not_found=True)
             if table is None:
                 return None
 
@@ -2196,10 +2216,7 @@ class AsyncSqliteDb(AsyncBaseDb):
                 await sess.execute(table.delete())
 
         except Exception as e:
-            from agno.utils.log import log_warning
-
-            log_warning(f"Exception deleting all cultural artifacts: {e}")
-            raise e
+            log_error(f"Exception deleting all cultural artifacts: {e}")
 
     async def delete_cultural_knowledge(self, id: str) -> None:
         """Delete a cultural artifact from the database.
@@ -2227,7 +2244,6 @@ class AsyncSqliteDb(AsyncBaseDb):
 
         except Exception as e:
             log_error(f"Error deleting cultural artifact: {e}")
-            raise e
 
     async def get_cultural_knowledge(
         self, id: str, deserialize: Optional[bool] = True
@@ -2263,7 +2279,7 @@ class AsyncSqliteDb(AsyncBaseDb):
 
         except Exception as e:
             log_error(f"Exception reading from cultural artifacts table: {e}")
-            raise e
+            return None
 
     async def get_all_cultural_knowledge(
         self,
@@ -2337,7 +2353,7 @@ class AsyncSqliteDb(AsyncBaseDb):
 
         except Exception as e:
             log_error(f"Error reading from cultural artifacts table: {e}")
-            raise e
+            return [] if deserialize else ([], 0)
 
     async def upsert_cultural_knowledge(
         self, cultural_knowledge: CulturalKnowledge, deserialize: Optional[bool] = True
@@ -2357,7 +2373,7 @@ class AsyncSqliteDb(AsyncBaseDb):
             Exception: If an error occurs during upsert.
         """
         try:
-            table = await self._get_table(table_type="culture")
+            table = await self._get_table(table_type="culture", create_table_if_not_found=True)
             if table is None:
                 return None
 
@@ -2440,86 +2456,113 @@ class AsyncSqliteDb(AsyncBaseDb):
             # Fallback if spans table doesn't exist
             return select(table, literal(0).label("total_spans"), literal(0).label("error_count"))
 
-    async def create_trace(self, trace: "Trace") -> None:
-        """Create a single trace record in the database.
+    def _get_trace_component_level_expr(self, workflow_id_col, team_id_col, agent_id_col, name_col):
+        """Build a SQL CASE expression that returns the component level for a trace.
+
+        Component levels (higher = more important):
+            - 3: Workflow root (.run or .arun with workflow_id)
+            - 2: Team root (.run or .arun with team_id)
+            - 1: Agent root (.run or .arun with agent_id)
+            - 0: Child span (not a root)
+
+        Args:
+            workflow_id_col: SQL column/expression for workflow_id
+            team_id_col: SQL column/expression for team_id
+            agent_id_col: SQL column/expression for agent_id
+            name_col: SQL column/expression for name
+
+        Returns:
+            SQLAlchemy CASE expression returning the component level as an integer.
+        """
+        from sqlalchemy import and_, case, or_
+
+        is_root_name = or_(name_col.contains(".run"), name_col.contains(".arun"))
+
+        return case(
+            # Workflow root (level 3)
+            (and_(workflow_id_col.isnot(None), is_root_name), 3),
+            # Team root (level 2)
+            (and_(team_id_col.isnot(None), is_root_name), 2),
+            # Agent root (level 1)
+            (and_(agent_id_col.isnot(None), is_root_name), 1),
+            # Child span or unknown (level 0)
+            else_=0,
+        )
+
+    async def upsert_trace(self, trace: "Trace") -> None:
+        """Create or update a single trace record in the database.
+
+        Uses INSERT ... ON CONFLICT DO UPDATE (upsert) to handle concurrent inserts
+        atomically and avoid race conditions.
 
         Args:
             trace: The Trace object to store (one per trace_id).
         """
+        from sqlalchemy import case
+
         try:
             table = await self._get_table(table_type="traces", create_table_if_not_found=True)
             if table is None:
                 return
 
+            trace_dict = trace.to_dict()
+            trace_dict.pop("total_spans", None)
+            trace_dict.pop("error_count", None)
+
             async with self.async_session_factory() as sess, sess.begin():
-                # Check if trace exists
-                result = await sess.execute(select(table).where(table.c.trace_id == trace.trace_id))
-                existing = result.fetchone()
+                # Use upsert to handle concurrent inserts atomically
+                # On conflict, update fields while preserving existing non-null context values
+                # and keeping the earliest start_time
+                insert_stmt = sqlite.insert(table).values(trace_dict)
 
-                if existing:
-                    # workflow (level 3) > team (level 2) > agent (level 1) > child/unknown (level 0)
+                # Build component level expressions for comparing trace priority
+                new_level = self._get_trace_component_level_expr(
+                    insert_stmt.excluded.workflow_id,
+                    insert_stmt.excluded.team_id,
+                    insert_stmt.excluded.agent_id,
+                    insert_stmt.excluded.name,
+                )
+                existing_level = self._get_trace_component_level_expr(
+                    table.c.workflow_id,
+                    table.c.team_id,
+                    table.c.agent_id,
+                    table.c.name,
+                )
 
-                    def get_component_level(workflow_id, team_id, agent_id, name):
-                        # Check if name indicates a root span
-                        is_root_name = ".run" in name or ".arun" in name
-
-                        if not is_root_name:
-                            return 0  # Child span (not a root)
-                        elif workflow_id:
-                            return 3  # Workflow root
-                        elif team_id:
-                            return 2  # Team root
-                        elif agent_id:
-                            return 1  # Agent root
-                        else:
-                            return 0  # Unknown
-
-                    existing_level = get_component_level(
-                        existing.workflow_id, existing.team_id, existing.agent_id, existing.name
-                    )
-                    new_level = get_component_level(trace.workflow_id, trace.team_id, trace.agent_id, trace.name)
-
-                    # Only update name if new trace is from a higher or equal level
-                    should_update_name = new_level > existing_level
-
-                    # Parse existing start_time to calculate correct duration
-                    existing_start_time_str = existing.start_time
-                    if isinstance(existing_start_time_str, str):
-                        existing_start_time = datetime.fromisoformat(existing_start_time_str.replace("Z", "+00:00"))
-                    else:
-                        existing_start_time = trace.start_time
-
-                    recalculated_duration_ms = int((trace.end_time - existing_start_time).total_seconds() * 1000)
-
-                    update_values = {
-                        "end_time": trace.end_time.isoformat(),
-                        "duration_ms": recalculated_duration_ms,
-                        "status": trace.status,
-                        "name": trace.name if should_update_name else existing.name,
-                    }
-
-                    # Update context fields ONLY if new value is not None (preserve non-null values)
-                    if trace.run_id is not None:
-                        update_values["run_id"] = trace.run_id
-                    if trace.session_id is not None:
-                        update_values["session_id"] = trace.session_id
-                    if trace.user_id is not None:
-                        update_values["user_id"] = trace.user_id
-                    if trace.agent_id is not None:
-                        update_values["agent_id"] = trace.agent_id
-                    if trace.team_id is not None:
-                        update_values["team_id"] = trace.team_id
-                    if trace.workflow_id is not None:
-                        update_values["workflow_id"] = trace.workflow_id
-
-                    stmt = update(table).where(table.c.trace_id == trace.trace_id).values(**update_values)
-                    await sess.execute(stmt)
-                else:
-                    trace_dict = trace.to_dict()
-                    trace_dict.pop("total_spans", None)
-                    trace_dict.pop("error_count", None)
-                    stmt = sqlite.insert(table).values(trace_dict)
-                    await sess.execute(stmt)
+                # Build the ON CONFLICT DO UPDATE clause
+                # Use MIN for start_time, MAX for end_time to capture full trace duration
+                # SQLite stores timestamps as ISO strings, so string comparison works for ISO format
+                # Duration is calculated as: (MAX(end_time) - MIN(start_time)) in milliseconds
+                # SQLite doesn't have epoch extraction, so we calculate duration using julianday
+                upsert_stmt = insert_stmt.on_conflict_do_update(
+                    index_elements=["trace_id"],
+                    set_={
+                        "end_time": func.max(table.c.end_time, insert_stmt.excluded.end_time),
+                        "start_time": func.min(table.c.start_time, insert_stmt.excluded.start_time),
+                        # Calculate duration in milliseconds using julianday (SQLite-specific)
+                        # julianday returns days, so multiply by 86400000 to get milliseconds
+                        "duration_ms": (
+                            func.julianday(func.max(table.c.end_time, insert_stmt.excluded.end_time))
+                            - func.julianday(func.min(table.c.start_time, insert_stmt.excluded.start_time))
+                        )
+                        * 86400000,
+                        "status": insert_stmt.excluded.status,
+                        # Update name only if new trace is from a higher-level component
+                        # Priority: workflow (3) > team (2) > agent (1) > child spans (0)
+                        "name": case(
+                            (new_level > existing_level, insert_stmt.excluded.name),
+                            else_=table.c.name,
+                        ),
+                        # Preserve existing non-null context values using COALESCE
+                        "run_id": func.coalesce(insert_stmt.excluded.run_id, table.c.run_id),
+                        "session_id": func.coalesce(insert_stmt.excluded.session_id, table.c.session_id),
+                        "user_id": func.coalesce(insert_stmt.excluded.user_id, table.c.user_id),
+                        "agent_id": func.coalesce(insert_stmt.excluded.agent_id, table.c.agent_id),
+                        "team_id": func.coalesce(insert_stmt.excluded.team_id, table.c.team_id),
+                        "workflow_id": func.coalesce(insert_stmt.excluded.workflow_id, table.c.workflow_id),
+                    },
+                )
+                await sess.execute(upsert_stmt)
 
         except Exception as e:
             log_error(f"Error creating trace: {e}")
@@ -2886,3 +2929,345 @@ class AsyncSqliteDb(AsyncBaseDb):
         except Exception as e:
             log_error(f"Error getting spans: {e}")
             return []
+
+    # -- Learning methods --
+    async def get_learning(
+        self,
+        learning_type: str,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve a learning record.
+
+        Args:
+            learning_type: Type of learning ('user_profile', 'session_context', etc.)
+            user_id: Filter by user ID.
+            agent_id: Filter by agent ID.
+            team_id: Filter by team ID.
+            workflow_id: Filter by workflow ID.
+            session_id: Filter by session ID.
+            namespace: Filter by namespace ('user', 'global', or custom).
+            entity_id: Filter by entity ID (for entity-specific learnings).
+            entity_type: Filter by entity type ('person', 'company', etc.).
+
+        Returns:
+            Dict with 'content' key containing the learning data, or None.
+        """
+        try:
+            table = await self._get_table(table_type="learnings")
+            if table is None:
+                return None
+
+            async with self.async_session_factory() as sess:
+                stmt = select(table).where(table.c.learning_type == learning_type)
+
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
+                if agent_id is not None:
+                    stmt = stmt.where(table.c.agent_id == agent_id)
+                if team_id is not None:
+                    stmt = stmt.where(table.c.team_id == team_id)
+                if workflow_id is not None:
+                    stmt = stmt.where(table.c.workflow_id == workflow_id)
+                if session_id is not None:
+                    stmt = stmt.where(table.c.session_id == session_id)
+                if namespace is not None:
+                    stmt = stmt.where(table.c.namespace == namespace)
+                if entity_id is not None:
+                    stmt = stmt.where(table.c.entity_id == entity_id)
+                if entity_type is not None:
+                    stmt = stmt.where(table.c.entity_type == entity_type)
+
+                result = await sess.execute(stmt)
+                row = result.fetchone()
+                if row is None:
+                    return None
+
+                row_dict = dict(row._mapping)
+                return {"content": row_dict.get("content")}
+
+        except Exception as e:
+            log_debug(f"Error retrieving learning: {e}")
+            return None
+
+    async def upsert_learning(
+        self,
+        id: str,
+        learning_type: str,
+        content: Dict[str, Any],
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Insert or update a learning record.
+
+        Args:
+            id: Unique identifier for the learning.
+            learning_type: Type of learning ('user_profile', 'session_context', etc.)
+            content: The learning content as a dict.
+            user_id: Associated user ID.
+            agent_id: Associated agent ID.
+            team_id: Associated team ID.
+            workflow_id: Associated workflow ID.
+            session_id: Associated session ID.
+            namespace: Namespace for scoping ('user', 'global', or custom).
+            entity_id: Associated entity ID (for entity-specific learnings).
+            entity_type: Entity type ('person', 'company', etc.).
+            metadata: Optional metadata.
+        """
+        try:
+            table = await self._get_table(table_type="learnings", create_table_if_not_found=True)
+            if table is None:
+                return
+
+            current_time = int(time.time())
+
+            async with self.async_session_factory() as sess, sess.begin():
+                stmt = sqlite.insert(table).values(
+                    learning_id=id,
+                    learning_type=learning_type,
+                    namespace=namespace,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    team_id=team_id,
+                    workflow_id=workflow_id,
+                    session_id=session_id,
+                    entity_id=entity_id,
+                    entity_type=entity_type,
+                    content=content,
+                    metadata=metadata,
+                    created_at=current_time,
+                    updated_at=current_time,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["learning_id"],
+                    set_=dict(
+                        content=content,
+                        metadata=metadata,
+                        updated_at=current_time,
+                    ),
+                )
+                await sess.execute(stmt)
+
+            log_debug(f"Upserted learning: {id}")
+
+        except Exception as e:
+            log_debug(f"Error upserting learning: {e}")
+
+    async def delete_learning(self, id: str) -> bool:
+        """Delete a learning record.
+
+        Args:
+            id: The learning ID to delete.
+
+        Returns:
+            True if deleted, False otherwise.
+        """
+        try:
+            table = await self._get_table(table_type="learnings")
+            if table is None:
+                return False
+
+            async with self.async_session_factory() as sess, sess.begin():
+                stmt = table.delete().where(table.c.learning_id == id)
+                result = await sess.execute(stmt)
+                return getattr(result, "rowcount", 0) > 0
+
+        except Exception as e:
+            log_debug(f"Error deleting learning: {e}")
+            return False
+
+    async def get_learnings(
+        self,
+        learning_type: Optional[str] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        team_id: Optional[str] = None,
+        workflow_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get multiple learning records.
+
+        Args:
+            learning_type: Filter by learning type.
+            user_id: Filter by user ID.
+            agent_id: Filter by agent ID.
+            team_id: Filter by team ID.
+            workflow_id: Filter by workflow ID.
+            session_id: Filter by session ID.
+            namespace: Filter by namespace ('user', 'global', or custom).
+            entity_id: Filter by entity ID (for entity-specific learnings).
+            entity_type: Filter by entity type ('person', 'company', etc.).
+            limit: Maximum number of records to return.
+
+        Returns:
+            List of learning records.
+        """
+        try:
+            table = await self._get_table(table_type="learnings")
+            if table is None:
+                return []
+
+            async with self.async_session_factory() as sess:
+                stmt = select(table)
+
+                if learning_type is not None:
+                    stmt = stmt.where(table.c.learning_type == learning_type)
+                if user_id is not None:
+                    stmt = stmt.where(table.c.user_id == user_id)
+                if agent_id is not None:
+                    stmt = stmt.where(table.c.agent_id == agent_id)
+                if team_id is not None:
+                    stmt = stmt.where(table.c.team_id == team_id)
+                if workflow_id is not None:
+                    stmt = stmt.where(table.c.workflow_id == workflow_id)
+                if session_id is not None:
+                    stmt = stmt.where(table.c.session_id == session_id)
+                if namespace is not None:
+                    stmt = stmt.where(table.c.namespace == namespace)
+                if entity_id is not None:
+                    stmt = stmt.where(table.c.entity_id == entity_id)
+                if entity_type is not None:
+                    stmt = stmt.where(table.c.entity_type == entity_type)
+
+                stmt = stmt.order_by(table.c.updated_at.desc())
+
+                if limit is not None:
+                    stmt = stmt.limit(limit)
+
+                result = await sess.execute(stmt)
+                results = result.fetchall()
+                return [dict(row._mapping) for row in results]
+
+        except Exception as e:
+            log_debug(f"Error getting learnings: {e}")
+            return []
+
+    # --- Components (Not yet supported for async) ---
+    def get_component(
+        self,
+        component_id: str,
+        component_type: Optional[ComponentType] = None,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def upsert_component(
+        self,
+        component_id: str,
+        component_type: Optional[ComponentType] = None,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def delete_component(
+        self,
+        component_id: str,
+        hard_delete: bool = False,
+    ) -> bool:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def list_components(
+        self,
+        component_type: Optional[ComponentType] = None,
+        include_deleted: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def create_component_with_config(
+        self,
+        component_id: str,
+        component_type: ComponentType,
+        name: Optional[str],
+        config: Dict[str, Any],
+        description: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        label: Optional[str] = None,
+        stage: str = "draft",
+        notes: Optional[str] = None,
+        links: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def get_config(
+        self,
+        component_id: str,
+        version: Optional[int] = None,
+        label: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def upsert_config(
+        self,
+        component_id: str,
+        config: Optional[Dict[str, Any]] = None,
+        version: Optional[int] = None,
+        label: Optional[str] = None,
+        stage: Optional[str] = None,
+        notes: Optional[str] = None,
+        links: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def delete_config(
+        self,
+        component_id: str,
+        version: int,
+    ) -> bool:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def list_configs(
+        self,
+        component_id: str,
+        include_config: bool = False,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def set_current_version(
+        self,
+        component_id: str,
+        version: int,
+    ) -> bool:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def get_links(
+        self,
+        component_id: str,
+        version: int,
+        link_kind: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def get_dependents(
+        self,
+        component_id: str,
+        version: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
+
+    def load_component_graph(
+        self,
+        component_id: str,
+        version: Optional[int] = None,
+        label: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError("Component methods not yet supported for async databases")
